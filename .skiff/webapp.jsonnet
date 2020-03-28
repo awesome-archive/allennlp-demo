@@ -58,18 +58,16 @@ local num_replicas = (
 );
 
 local topLevelDomain = '.apps.allenai.org';
-local canonicalTopLevelDomain = '.allennlp.org';
 
-local hosts = [
+// Only register demo.allennlp.org for production environments, there's
+// no wildcard entry (*.allennlp.org) directing URLs with the environment
+// as a subdomain to the Skiff cluster. If a URL is included here that
+// isn't routed to the cluster a TLS certificate can't be issued.
+local hosts =
     if env == 'prod' then
-        config.appName + topLevelDomain
+        [ config.appName + topLevelDomain, 'demo.allennlp.org' ]
     else
-        config.appName + '.' + env + topLevelDomain,
-    if env == 'prod' then
-        'demo' + canonicalTopLevelDomain
-    else
-        'demo' + '.' + env + canonicalTopLevelDomain
-];
+        [ config.appName + '.' + env + topLevelDomain ];
 
 // Each app gets it's own namespace
 local namespaceName = config.appName;
@@ -87,7 +85,8 @@ local fullyQualifiedName = config.appName + '-' + env;
 local labels = {
     app: config.appName,
     env: env,
-    contact: config.contact
+    contact: config.contact,
+    team: config.team
 };
 
 local model_labels(model_name) = labels + {
@@ -154,14 +153,21 @@ local cloudsql_volumes = [
     }
 ];
 
-// Generate the ingress path entry for the given model
-local predict_path(model_name) = {
-    path: '/predict/' + model_name,
+// Each model typically has its own service running that handles several different endpoints
+// (/predict, /permadata, /task, /attack, etc.).  This is a convenience function that will route
+// all of those endpoints to the model service, instead of the main frontend.
+// TODO(mattg): we might want to change this some day so that all model backend services start with
+// /model/[model-name], so that we only have to have one route per backend, instead of this mess of
+// registering every endpoint separately.
+local model_path(model_name, endpoint, url_extra='') = {
+    path: '/' + endpoint + '/' + model_name + url_extra,
     backend: {
         serviceName: fullyQualifiedName + '-' + model_name,
         servicePort: config.httpPort
     },
 };
+
+
 
 local ingress = {
     apiVersion: 'extensions/v1beta1',
@@ -175,7 +181,10 @@ local ingress = {
             'kubernetes.io/ingress.class': 'nginx',
             'nginx.ingress.kubernetes.io/ssl-redirect': 'true',
             'nginx.ingress.kubernetes.io/enable-cors': 'false',
-            'nginx.ingress.kubernetes.io/use-regex': 'true'
+            'nginx.ingress.kubernetes.io/use-regex': 'true',
+            'apps.allenai.org/build': std.extVar('buildId'),
+            'apps.allenai.org/sha': std.extVar('sha'),
+            'apps.allenai.org/repo': std.extVar('repo')
         }
     },
     spec: {
@@ -190,7 +199,33 @@ local ingress = {
                 host: host,
                 http: {
                     paths: [
-                        predict_path(model_name)
+                        // The backend for each model is served at /predict/{model_name} (in its
+                        // own service) so we need to generate an ingress path entry that points
+                        // that path to that service.
+                        model_path(model_name, 'predict')
+                        for model_name in model_names
+                    ] + [
+                        // Attacking is handled by the model backend.
+                        model_path(model_name, 'attack')
+                        for model_name in model_names
+                    ] + [
+                        // Interpreting is handled by the model backend.
+                        model_path(model_name, 'interpret')
+                        for model_name in model_names
+                    ] + [
+                        // The (chromeless) frontend for each model is served at /task/{model_name}
+                        // (in its own service) so we need to generate an ingress path entry that
+                        // points that path to that service.
+                        // The extra bit on the url is because this will sometimes have permadata
+                        // on it also.
+                        // TODO: allow the frontend and the backend to be different services?
+                        model_path(model_name, 'task', "(/[.*])?")
+                        for model_name in model_names
+                    ] + [
+                        // We also want to pass through the permadata/ requests to each model,
+                        // because different models might handle them in different ways (or not at
+                        // all).
+                        model_path(model_name, 'permadata')
                         for model_name in model_names
                     ] + [
                         {
@@ -311,6 +346,13 @@ local DEFAULT_MEMORY = "1Gi";
 local get_cpu(model_name) = if std.objectHas(models[model_name], "cpu") then models[model_name]["cpu"] else DEFAULT_CPU;
 local get_memory(model_name) = if std.objectHas(models[model_name], "memory") then models[model_name]["memory"] else DEFAULT_MEMORY;
 
+// A model can specify its own docker image by providing an environment
+// variable with the image name. It needs to run a server on config.port
+// that serves up the model at /predict/{model_name}
+// and that serves up the front-end at /task/{model_name}
+// and that (optionally) serves up permalinks at /permadata/{model_name},
+local get_image(model_name) = if std.objectHas(models[model_name], "image") then models[model_name]["image"] else image;
+
 local model_deployment(model_name) = {
     apiVersion: 'extensions/v1beta1',
     kind: 'Deployment',
@@ -331,8 +373,8 @@ local model_deployment(model_name) = {
             spec: {
                 containers: [
                     {
-                        name: "model",
-                        image: image,
+                        name: model_name,
+                        image: get_image(model_name),
                         args: [ '--model', model_name ],
                         readinessProbe: readinessProbe,
                         resources: {
